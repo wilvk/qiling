@@ -109,6 +109,13 @@ class MachPortManager():
         self.semaphore_port = MachPort(0x903)
         self.special_port = MachPort(0x707)
         self.my_port = my_port
+        # allocator for dynamically constructed ports (e.g. mach_port_construct)
+        self._next_port_name = 0x1100
+
+    def alloc_port_name(self):
+        name = self._next_port_name
+        self._next_port_name += 4
+        return name
 
     def deal_with_msg(self, msg, addr):
 
