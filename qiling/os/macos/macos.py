@@ -19,6 +19,7 @@ from qiling.os.macos.events.macos_policy import QlMacOSPolicy
 from qiling.os.macos.events.macos_structs import mac_policy_list_t
 from qiling.os.macos.structs import kmod_info_t, POINTER64
 from qiling.os.posix.syscall.abi import arm
+from qiling.os.posix.syscall.abi import intel as syscall_intel
 
 
 class QlOsMacos(QlOsPosix):
@@ -31,6 +32,8 @@ class QlOsMacos(QlOsPosix):
         # here anyway for completion
         if ql.arch.type is QL_ARCH.ARM64:
             self.syscall_abi = arm.QlAArch64MacOS(ql.arch)
+        elif ql.arch.type is QL_ARCH.X8664:
+            self.syscall_abi = syscall_intel.QlIntel64Macos(ql.arch)
 
         self.fcall = QlFunctionCall(ql, intel.macosx64(ql.arch))
 

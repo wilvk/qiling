@@ -1223,6 +1223,12 @@ def transform_path(ql: Qiling, dirfd: int, path: int, flags: int = 0):
     if 0 < dirfd < NR_OPEN:
         return ql.os.fd[dirfd].fileno(), path
 
+    # fall-back: macOS uses AT_FDCWD = -2 (Linux uses -100), and a relative path
+    # paired with an unresolvable/invalid dirfd would otherwise drop through and
+    # return None (crashing the caller). resolve relative to cwd so the caller
+    # gets a real errno (e.g. ENOENT) instead.
+    return None, ql.os.path.transform_to_real_path(path)
+
 
 def ql_syscall_chmod(ql: Qiling, filename: int, mode: int):
     vpath = ql.os.utils.read_cstring(filename)

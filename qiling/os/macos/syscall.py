@@ -110,6 +110,13 @@ def ql_syscall_kernelrpc_mach_vm_map_trap(ql, target, address, size, mask, flags
     ql.mem.write(address, struct.pack("<Q", vmmap_address))
     return KERN_SUCCESS
 
+# 0xe
+def ql_syscall_kernelrpc_mach_vm_protect_trap(ql, target, address, size, set_maximum, new_protection, *args, **kw):
+    ql.log.debug("[mach] mach vm protect trap(target: 0x%x, address: 0x%x, size: 0x%x, set_max: 0x%x, new_protect: 0x%x)" % (
+        target, address, size, set_maximum, new_protection
+    ))
+    return KERN_SUCCESS
+
 # 0x12
 def ql_syscall_kernelrpc_mach_port_deallocate_trap(ql, *args, **kw):
     ql.log.debug("[mach] mach port deallocate trap")
@@ -126,7 +133,11 @@ def ql_syscall_kernelrpc_mach_port_construct_trap(ql, target, options, context, 
     ql.log.debug("[mach] mach port construct trap(target: 0x%x, options: 0x%x, context: 0x%x, name: 0x%x)" % (
         target, options, context, name
     ))
-    pass
+    # allocate a fresh port name and hand it back through the out-parameter so that
+    # callers such as dyld's mig_get_reply_port get a valid reply port
+    port_name = ql.os.macho_port_manager.alloc_port_name()
+    ql.mem.write(name, struct.pack("<I", port_name))
+    return KERN_SUCCESS
 
 # 0x1a
 def ql_syscall_mach_reply_port(ql, *args, **kw):
@@ -159,6 +170,38 @@ def ql_syscall_mach_msg_trap(ql, args, opt, ssize, rsize, rname, timeout):
     mach_msg.read_msg_from_mem(args, ssize)
     ql.log.debug("Recv-> Header: %s, Content: %s" % (mach_msg.header, mach_msg.content))
     ql.os.macho_port_manager.deal_with_msg(mach_msg, args)
+    return 0
+
+# 0x2f
+# modern dyld/libsyscall use the consolidated mach_msg2 trap instead of mach_msg_trap.
+# the message header fields are packed into the (register) arguments rather than being
+# read solely from memory. reconstruct the header into the message buffer and delegate
+# to the existing mach_msg dispatch path. (the 7th/8th args - rcv_size/priority and
+# timeout - live on the stack and are not needed to dispatch a MIG round-trip.)
+def ql_syscall_mach_msg2_trap(ql, data, options, msgh_bits_and_send_size, msgh_remote_and_local_port, msgh_voucher_and_id, desc_count_and_rcv_name, *args, **kw):
+    msgh_bits     = msgh_bits_and_send_size & 0xffffffff
+    send_size     = msgh_bits_and_send_size >> 32
+    remote_port   = msgh_remote_and_local_port & 0xffffffff
+    local_port    = msgh_remote_and_local_port >> 32
+    voucher_port  = msgh_voucher_and_id & 0xffffffff
+    msgh_id       = msgh_voucher_and_id >> 32
+    rcv_name      = desc_count_and_rcv_name >> 32
+
+    ql.log.debug("[mach] mach_msg2_trap(data: 0x%x, options: 0x%x, bits: 0x%x, size: 0x%x, remote: 0x%x, local: 0x%x, id: %d, rcv_name: 0x%x)" % (
+        data, options, msgh_bits, send_size, remote_port, local_port, msgh_id, rcv_name))
+
+    # materialize the header in the message buffer so MachMsg.read_msg_from_mem sees it
+    ql.mem.write(data + 0x00, struct.pack("<L", msgh_bits))
+    ql.mem.write(data + 0x04, struct.pack("<L", send_size))
+    ql.mem.write(data + 0x08, struct.pack("<L", remote_port))
+    ql.mem.write(data + 0x0c, struct.pack("<L", local_port))
+    ql.mem.write(data + 0x10, struct.pack("<L", voucher_port))
+    ql.mem.write(data + 0x14, struct.pack("<L", msgh_id))
+
+    mach_msg = MachMsg(ql)
+    mach_msg.read_msg_from_mem(data, send_size)
+    ql.log.debug("Recv-> Header: %s, Content: %s" % (mach_msg.header, mach_msg.content))
+    ql.os.macho_port_manager.deal_with_msg(mach_msg, data)
     return 0
 
 

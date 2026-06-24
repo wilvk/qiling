@@ -394,16 +394,24 @@ class QlLoaderMACHO(QlLoader):
                 if pass_count == 3:
                     if cmd.cmd_id == LC_LOAD_DYLINKER:
                         self.loadDylinker(cmd)
-                        self.using_dyld = True
                         if not isdyld:
                             if not self.dyld_path:
                                 raise QlErrorMACHOFormat("Error No Dyld path")
-                            self.dyld_path =  os.path.join(self.ql.rootfs + self.dyld_path)
-                            self.dyld_file = MachoParser(self.ql, self.dyld_path)
-                            self.loading_file = self.dyld_file
-                            self.proc_entry = self.loadMacho(depth + 1, True)
-                            self.loading_file = self.macho_file
-                            self.using_dyld = True
+                            dyld_real_path = os.path.join(self.ql.rootfs + self.dyld_path)
+                            if os.path.exists(dyld_real_path):
+                                self.using_dyld = True
+                                self.dyld_path = dyld_real_path
+                                self.dyld_file = MachoParser(self.ql, self.dyld_path)
+                                self.loading_file = self.dyld_file
+                                self.proc_entry = self.loadMacho(depth + 1, True)
+                                self.loading_file = self.macho_file
+                            else:
+                                # No dynamic linker present in the rootfs. Load the binary
+                                # directly and let its imported symbols be satisfied
+                                # externally (e.g. by hooking their __stubs). The process
+                                # entry then comes from LC_MAIN / LC_UNIXTHREAD.
+                                self.ql.log.warning(f'dyld not found at {dyld_real_path}; running without dynamic linker (imports must be stubbed)')
+                                self.using_dyld = False
 
         if depth == 0:
             self.mmap_address = mmap_address
