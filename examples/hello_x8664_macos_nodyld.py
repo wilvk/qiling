@@ -90,6 +90,66 @@ def discover_stubs(path: str) -> dict:
     return mapping
 
 
+def discover_data_imports(path: str) -> dict:
+    """Map each non-lazy symbol pointer (__got / __nl_symbol_ptr) slot to the
+    imported *data* symbol it should hold. These are what dyld would normally
+    bind (e.g. ___stack_chk_guard); without dyld they stay zero."""
+
+    data = open(path, "rb").read()
+    (ncmds,) = struct.unpack_from("<I", data, 16)
+    off = 32
+
+    symoff = stroff = 0
+    indirectsymoff = 0
+    nl_sects = []  # (addr, size, reserved1 index)
+
+    for _ in range(ncmds):
+        cmd, cmdsize = struct.unpack_from("<II", data, off)
+
+        if cmd == 0x19:  # LC_SEGMENT_64
+            (nsects,) = struct.unpack_from("<I", data, off + 64)
+            so = off + 72
+
+            for _s in range(nsects):
+                addr, size = struct.unpack_from("<QQ", data, so + 32)
+                (flags,) = struct.unpack_from("<I", data, so + 64)
+                (reserved1,) = struct.unpack_from("<I", data, so + 68)
+
+                if (flags & 0xFF) == 0x06:  # S_NON_LAZY_SYMBOL_POINTERS
+                    nl_sects.append((addr, size, reserved1))
+
+                so += 80
+
+        elif cmd == 0x02:  # LC_SYMTAB
+            symoff, _nsyms, stroff, _strsize = struct.unpack_from("<IIII", data, off + 8)
+
+        elif cmd == 0x0B:  # LC_DYSYMTAB
+            indirectsymoff, _nindirect = struct.unpack_from("<II", data, off + 56)
+
+        off += cmdsize
+
+    INDIRECT_SYMBOL_LOCAL = 0x80000000
+    INDIRECT_SYMBOL_ABS = 0x40000000
+
+    def sym_name(symidx: int) -> str:
+        (n_strx,) = struct.unpack_from("<I", data, symoff + symidx * 16)
+        end = data.index(b"\x00", stroff + n_strx)
+        return data[stroff + n_strx:end].decode()
+
+    mapping = {}
+
+    for addr, size, reserved1 in nl_sects:
+        for i in range(size // 8):
+            (ind,) = struct.unpack_from("<I", data, indirectsymoff + (reserved1 + i) * 4)
+
+            if ind & (INDIRECT_SYMBOL_LOCAL | INDIRECT_SYMBOL_ABS):
+                continue
+
+            mapping[addr + i * 8] = sym_name(ind)
+
+    return mapping
+
+
 def read_cstr(ql: Qiling, ptr: int, maxlen: int = 8192) -> bytes:
     out = bytearray()
 
@@ -115,10 +175,24 @@ def c_format(ql: Qiling, fmt: str, args) -> str:
         if c == "%" and i + 1 < len(fmt):
             j = i + 1
 
-            while j < len(fmt) and fmt[j] in "-+ #0123456789.lhzL":
+            while j < len(fmt) and fmt[j] in "-+ #0123456789.*lhzjtL":
                 j += 1
 
+            mod = fmt[i + 1:j]
             spec = fmt[j] if j < len(fmt) else "%"
+
+            # integer width from the length modifier (a bare int is 32-bit, and the
+            # caller zero-extends it into the 64-bit arg register, so we must mask)
+            if any(m in mod for m in ("l", "z", "j", "t")):
+                bits = 64
+            elif "hh" in mod:
+                bits = 8
+            elif "h" in mod:
+                bits = 16
+            else:
+                bits = 32
+
+            mask = (1 << bits) - 1
 
             if spec == "%":
                 out.append("%")
@@ -126,11 +200,12 @@ def c_format(ql: Qiling, fmt: str, args) -> str:
                 a = args[ai] if ai < len(args) else 0
 
                 if spec in "di":
-                    out.append(str(a - (1 << 64) if a >> 63 else a)); ai += 1
+                    v = a & mask
+                    out.append(str(v - (1 << bits) if v >> (bits - 1) else v)); ai += 1
                 elif spec == "u":
-                    out.append(str(a)); ai += 1
+                    out.append(str(a & mask)); ai += 1
                 elif spec in "xX":
-                    out.append(format(a, spec)); ai += 1
+                    out.append(format(a & mask, spec)); ai += 1
                 elif spec == "p":
                     out.append(hex(a)); ai += 1
                 elif spec == "c":
@@ -200,6 +275,18 @@ def my_sandbox():
             impl = make_logger(name)
 
         ql.hook_address(impl, addr + slide)
+
+    # Bind non-lazy / GOT data imports that dyld would normally fill in. Each slot
+    # gets a backing cell; ___stack_chk_guard needs a consistent (non-zero) value
+    # so the stack-canary prologue/epilogue agree, others default to zero.
+    for slot, name in discover_data_imports(TARGET).items():
+        if name == "dyld_stub_binder":
+            continue
+
+        cell = ql.os.heap.alloc(8)
+        value = 0xA5A5A5A5A5A5A500 if name == "___stack_chk_guard" else 0
+        ql.mem.write(cell, struct.pack("<Q", value))
+        ql.mem.write(slot + slide, struct.pack("<Q", cell))
 
     # build SysV ABI state for main(argc, argv, envp, apple), bypassing libdyld glue
     kstack = ql.loader.stack_sp
